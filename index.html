@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Flux - Kinetic Merge</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #020204;
+            color: #fff;
+            font-family: 'Inter', system-ui, sans-serif;
+            touch-action: none;
+        }
+        canvas { display: block; }
+        .glass-ui {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        #slingshot-line {
+            position: absolute;
+            pointer-events: none;
+            z-index: 5;
+            transform-origin: 0 50%;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.8));
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui" class="fixed inset-0 pointer-events-none flex flex-col justify-between p-6 z-10">
+    <div class="flex justify-between items-start">
+        <div class="glass-ui px-5 py-3 rounded-2xl">
+            <p class="text-[9px] font-bold uppercase tracking-[0.3em] text-indigo-400 mb-1">Energy Level</p>
+            <h1 id="score" class="text-3xl font-light tracking-tight">0</h1>
+        </div>
+        
+        <div class="glass-ui p-3 rounded-2xl flex flex-col items-center min-w-[70px]">
+            <p class="text-[8px] uppercase tracking-widest opacity-40 mb-1">Incoming</p>
+            <div id="preview-ball" class="w-8 h-8 rounded-full shadow-lg transition-all duration-300"></div>
+        </div>
+    </div>
+
+    <div id="hint" class="text-center mb-6 opacity-30 text-[9px] uppercase tracking-[0.5em] animate-pulse">
+        Pull Back & Release to Fling
+    </div>
+</div>
+
+<div id="slingshot-line"></div>
+
+<script>
+    const { Engine, Render, Runner, Bodies, Composite, Body, Events, Vector } = Matter;
+
+    const COLORS = [
+        { level: 0, radius: 12, fill: '#818cf8', glow: '#6366f1', value: 10 },
+        { level: 1, radius: 18, fill: '#34d399', glow: '#10b981', value: 20 },
+        { level: 2, radius: 26, fill: '#fbbf24', glow: '#f59e0b', value: 40 },
+        { level: 3, radius: 36, fill: '#f87171', glow: '#ef4444', value: 80 },
+        { level: 4, radius: 48, fill: '#38bdf8', glow: '#0ea5e9', value: 160 },
+        { level: 5, radius: 62, fill: '#c084fc', glow: '#a855f7', value: 320 },
+        { level: 6, radius: 78, fill: '#fde047', glow: '#facc15', value: 640 }
+    ];
+
+    let engine, render, runner;
+    let score = 0;
+    let nextLevel = 0;
+    let isDragging = false;
+    let startPoint = { x: 0, y: 0 };
+    let particles = [];
+    let screenShake = 0;
+
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playNote(freq, vol = 0.05, dur = 0.5) {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + dur);
+    }
+
+    class Particle {
+        constructor(x, y, color) {
+            this.x = x; this.y = y; this.color = color;
+            const angle = Math.random() * Math.PI * 2;
+            const speed = Math.random() * 5 + 2;
+            this.vx = Math.cos(angle) * speed;
+            this.vy = Math.sin(angle) * speed;
+            this.life = 1.0;
+        }
+        update() { this.x += this.vx; this.y += this.vy; this.life -= 0.02; }
+        draw(ctx) {
+            ctx.globalAlpha = this.life;
+            ctx.fillStyle = this.color;
+            ctx.beginPath(); ctx.arc(this.x, this.y, 2, 0, Math.PI * 2); ctx.fill();
+        }
+    }
+
+    function init() {
+        engine = Engine.create({ gravity: { x: 0, y: 0 } });
+        render = Render.create({
+            element: document.body,
+            engine: engine,
+            options: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                wireframes: false,
+                background: '#020204'
+            }
+        });
+
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        const walls = [
+            Bodies.rectangle(width/2, -50, width, 100, { isStatic: true }),
+            Bodies.rectangle(width/2, height + 50, width, 100, { isStatic: true }),
+            Bodies.rectangle(-50, height/2, 100, height, { isStatic: true }),
+            Bodies.rectangle(width + 50, height/2, 100, height, { isStatic: true })
+        ];
+        Composite.add(engine.world, walls);
+
+        Render.run(render);
+        runner = Runner.create();
+        Runner.run(runner, engine);
+
+        updatePreview();
+
+        Events.on(engine, 'beforeUpdate', () => {
+            const bodies = Composite.allBodies(engine.world);
+            const center = { x: width/2, y: height/2 };
+            bodies.forEach(body => {
+                if (!body.isStatic) {
+                    const forceMagnitude = 0.000001 * body.mass;
+                    const delta = Vector.sub(center, body.position);
+                    const distance = Vector.magnitude(delta);
+                    if (distance > 10) {
+                        const force = Vector.mult(Vector.normalise(delta), forceMagnitude * (distance * 0.1));
+                        Body.applyForce(body, body.position, force);
+                    }
+                    Body.setVelocity(body, Vector.mult(body.velocity, 0.985));
+                    Body.setAngularVelocity(body, body.angularVelocity * 0.98);
+                }
+            });
+        });
+
+        Events.on(render, 'afterRender', () => {
+            const ctx = render.context;
+            const time = Date.now();
+
+            ctx.beginPath();
+            ctx.arc(width/2, height/2, 40 + Math.sin(time*0.005)*5, 0, Math.PI*2);
+            ctx.fillStyle = 'rgba(99, 102, 241, 0.05)';
+            ctx.fill();
+
+            if (screenShake > 0) {
+                ctx.translate((Math.random()-0.5)*screenShake, (Math.random()-0.5)*screenShake);
+                screenShake *= 0.9;
+            }
+
+            particles.forEach((p, i) => {
+                p.update(); p.draw(ctx);
+                if (p.life <= 0) particles.splice(i, 1);
+            });
+
+            const bodies = Composite.allBodies(engine.world);
+            bodies.forEach(body => {
+                if (body.essenceData) {
+                    const r = body.circleRadius;
+                    const { fill, glow } = body.essenceData;
+                    ctx.save();
+                    ctx.translate(body.position.x, body.position.y);
+                    ctx.rotate(body.angle);
+                    
+                    ctx.shadowBlur = r * 0.8;
+                    ctx.shadowColor = glow;
+                    ctx.fillStyle = fill;
+                    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+                    
+                    ctx.shadowBlur = 0;
+                    ctx.fillStyle = '#fff'; ctx.globalAlpha = 0.3;
+                    ctx.beginPath(); ctx.arc(-r*0.3, -r*0.3, r*0.2, 0, Math.PI * 2); ctx.fill();
+                    ctx.restore();
+                }
+            });
+        });
+
+        Events.on(engine, 'collisionStart', (event) => {
+            event.pairs.forEach((pair) => {
+                const { bodyA, bodyB } = pair;
+                if (bodyA.essenceData && bodyB.essenceData && bodyA.essenceLevel === bodyB.essenceLevel) {
+                    merge(bodyA, bodyB);
+                }
+            });
+        });
+
+        window.addEventListener('mousedown', (e) => startDrag(e.clientX, e.clientY));
+        window.addEventListener('mousemove', (e) => updateDrag(e.clientX, e.clientY));
+        window.addEventListener('mouseup', endDrag);
+        window.addEventListener('touchstart', (e) => startDrag(e.touches[0].clientX, e.touches[0].clientY));
+        window.addEventListener('touchmove', (e) => updateDrag(e.touches[0].clientX, e.touches[0].clientY));
+        window.addEventListener('touchend', endDrag);
+    }
+
+    function startDrag(x, y) {
+        isDragging = true;
+        startPoint = { x, y };
+        document.getElementById('slingshot-line').style.display = 'block';
+    }
+
+    function updateDrag(x, y) {
+        if (!isDragging) return;
+        const line = document.getElementById('slingshot-line');
+        const dx = x - startPoint.x;
+        const dy = y - startPoint.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const angle = Math.atan2(dy, dx);
+        
+        line.style.width = dist + 'px';
+        line.style.left = startPoint.x + 'px';
+        line.style.top = startPoint.y + 'px';
+        line.style.transform = `rotate(${angle}rad)`;
+    }
+
+    function endDrag(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        document.getElementById('slingshot-line').style.display = 'none';
+        
+        const eventObj = e.changedTouches ? e.changedTouches[0] : e;
+        const endX = eventObj.clientX;
+        const endY = eventObj.clientY;
+        
+        const forceX = (startPoint.x - endX) * 0.15;
+        const forceY = (startPoint.y - endY) * 0.15;
+        
+        launch(startPoint.x, startPoint.y, forceX, forceY);
+    }
+
+    function launch(x, y, vx, vy) {
+        const essence = createEssence(x, y, nextLevel);
+        Composite.add(engine.world, essence);
+        Body.setVelocity(essence, { x: vx, y: vy });
+        
+        playNote(100 + nextLevel * 50, 0.03, 0.2);
+        nextLevel = Math.floor(Math.random() * 3);
+        updatePreview();
+        document.getElementById('hint').style.opacity = '0';
+    }
+
+    function merge(a, b) {
+        const midX = (a.position.x + b.position.x) / 2;
+        const midY = (a.position.y + b.position.y) / 2;
+        const level = a.essenceLevel;
+
+        Composite.remove(engine.world, [a, b]);
+
+        if (level < COLORS.length - 1) {
+            const nextLvl = level + 1;
+            const newEssence = createEssence(midX, midY, nextLvl);
+            Composite.add(engine.world, newEssence);
+            
+            score += COLORS[nextLvl].value;
+            document.getElementById('score').innerText = score;
+            playNote(200 + nextLvl * 100, 0.05, 0.6);
+            
+            for(let i=0; i<15; i++) particles.push(new Particle(midX, midY, COLORS[nextLvl].glow));
+            screenShake = nextLvl * 2;
+        } else {
+            score += 2000;
+            screenShake = 20;
+            playNote(80, 0.1, 1.5);
+            for(let i=0; i<50; i++) particles.push(new Particle(midX, midY, '#fff'));
+        }
+    }
+
+    function createEssence(x, y, level) {
+        const data = COLORS[level];
+        const essence = Bodies.circle(x, y, data.radius, {
+            restitution: 0.6, friction: 0.01, density: 0.002, render: { visible: false }
+        });
+        essence.essenceData = data;
+        essence.essenceLevel = level;
+        return essence;
+    }
+
+    function updatePreview() {
+        const ball = document.getElementById('preview-ball');
+        const data = COLORS[nextLevel];
+        ball.style.backgroundColor = data.fill;
+        ball.style.boxShadow = `0 0 15px ${data.glow}`;
+        ball.style.transform = `scale(${0.6 + nextLevel * 0.2})`;
+    }
+
+    window.onload = init;
+</script>
+
+</body>
+</html>
